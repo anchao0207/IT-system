@@ -21,6 +21,7 @@ yarn-error.log*
 # env files
 .env*
 !.env.example
+!.env.server.example
 
 # docker/local data
 /baserow-data

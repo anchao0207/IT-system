@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    container_name: computech-ops-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BASEROW_URL: http://baserow
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - baserow
+
+  baserow:
+    image: baserow/baserow:2.2.2
+    container_name: computech-baserow
+    restart: unless-stopped
+    environment:
+      BASEROW_PUBLIC_URL: ${BASEROW_PUBLIC_URL:-http://localhost:8080}
+      SECRET_KEY: ${BASEROW_JWT_SECRET:?Set BASEROW_JWT_SECRET in .env}
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - baserow_data:/baserow/data
+
+volumes:
+  baserow_data:
