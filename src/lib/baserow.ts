@@ -46,6 +46,54 @@ const tableEnv: Record<TableKey, string> = {
   timeEntries: "BASEROW_TIME_ENTRIES_TABLE_ID",
 };
 
+const fieldMap: Record<TableKey, Record<string, string | null>> = {
+  organizations: {},
+  locations: {
+    organizationId: "Organizations",
+  },
+  users: {
+    organizationId: "Organizations",
+  },
+  equipment: {
+    organizationId: "Organizations",
+    locationId: "Locations",
+    ownership: null,
+  },
+  tickets: {
+    organizationId: "Organizations",
+    userId: "Users",
+    equipmentId: "Equipments",
+    locationId: "Locations",
+  },
+  ticketUpdates: {
+    ticketId: "Tickets",
+  },
+  timeEntries: {},
+};
+
+const linkRowFields: Record<TableKey, Set<string>> = {
+  organizations: new Set(),
+  locations: new Set(["Organizations"]),
+  users: new Set(["Organizations"]),
+  equipment: new Set(["Organizations", "Locations"]),
+  tickets: new Set(["Organizations", "Users", "Equipments", "Locations"]),
+  ticketUpdates: new Set(["Tickets"]),
+  timeEntries: new Set(),
+};
+
+function baserowFieldFor(table: TableKey, appField: string) {
+  return Object.prototype.hasOwnProperty.call(fieldMap[table], appField)
+    ? fieldMap[table][appField]
+    : appField;
+}
+
+function appFieldFor(table: TableKey, baserowField: string) {
+  const mapped = Object.entries(fieldMap[table]).find(
+    ([, fieldName]) => fieldName === baserowField,
+  );
+  return mapped?.[0] ?? baserowField;
+}
+
 const demoOrganizations: Organization[] = [
   {
     id: 1,
@@ -250,15 +298,53 @@ function normalizeValue(key: string, value: unknown): unknown {
   return value;
 }
 
-function normalizeRow<T>(row: Record<string, unknown>): T {
+function normalizeRow<T>(table: TableKey, row: Record<string, unknown>): T {
   const normalized = Object.fromEntries(
-    Object.entries(row).map(([key, value]) => [key, normalizeValue(key, value)]),
+    Object.entries(row).map(([key, value]) => {
+      const appField = appFieldFor(table, key);
+      return [appField, normalizeValue(appField, value)];
+    }),
   );
 
   return {
     ...normalized,
     id: Number(row.id),
   } as T;
+}
+
+function mapOrderBy(table: TableKey, orderBy: string) {
+  const descending = orderBy.startsWith("-");
+  const field = descending ? orderBy.slice(1) : orderBy;
+  const baserowField = baserowFieldFor(table, field);
+  if (!baserowField) return null;
+  return descending ? "-" + baserowField : baserowField;
+}
+
+function mapFilter(table: TableKey, filter: RowFilter) {
+  const baserowField = baserowFieldFor(table, filter.field);
+  if (!baserowField) return null;
+  return { ...filter, field: baserowField };
+}
+
+function normalizeLinkRowValue(value: unknown) {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function valuesForBaserow(table: TableKey, values: Record<string, unknown>) {
+  return Object.fromEntries(
+    Object.entries(values).flatMap(([key, value]) => {
+      const baserowField = baserowFieldFor(table, key);
+      if (!baserowField || value === undefined) return [];
+
+      if (linkRowFields[table].has(baserowField)) {
+        return [[baserowField, normalizeLinkRowValue(value)]];
+      }
+
+      return [[baserowField, value]];
+    }),
+  );
 }
 
 async function baserowRequest<T>(
@@ -374,16 +460,26 @@ function applyDemoListOptions<T>(rows: T[], options?: ListRowsOptions) {
   }, filteredRows);
 }
 
-function listRowsUrl(baseUrl: string, tableId: string, options?: ListRowsOptions) {
+function listRowsUrl(
+  table: TableKey,
+  baseUrl: string,
+  tableId: string,
+  options?: ListRowsOptions,
+) {
   const url = new URL(`${baseUrl}/api/database/rows/table/${tableId}/`);
   url.searchParams.set("user_field_names", "true");
   url.searchParams.set("size", String(options?.size || 200));
 
   if (options?.orderBy?.length) {
-    url.searchParams.set("order_by", options.orderBy.join(","));
+    const orderBy = options.orderBy
+      .map((field) => mapOrderBy(table, field))
+      .filter((field): field is string => Boolean(field));
+    if (orderBy.length) url.searchParams.set("order_by", orderBy.join(","));
   }
 
-  for (const filter of options?.filters || []) {
+  for (const filter of (options?.filters || [])
+    .map((item) => mapFilter(table, item))
+    .filter((item): item is RowFilter => Boolean(item))) {
     url.searchParams.set(`filter__${filter.field}__${filter.type}`, String(filter.value));
   }
 
@@ -395,7 +491,7 @@ export async function listRows<T>(table: TableKey, options?: ListRowsOptions): P
   if (!config) return applyDemoListOptions(demoData[table] as T[], options);
 
   const rows: Record<string, unknown>[] = [];
-  let nextUrl: string | null = listRowsUrl(config.baseUrl, config.tableId, options);
+  let nextUrl: string | null = listRowsUrl(table, config.baseUrl, config.tableId, options);
 
   while (nextUrl) {
     const payload: BaserowListPayload = await baserowRequest<BaserowListPayload>(
@@ -409,7 +505,7 @@ export async function listRows<T>(table: TableKey, options?: ListRowsOptions): P
     nextUrl = payload.next || null;
   }
 
-  return rows.map((row) => normalizeRow<T>(row));
+  return rows.map((row) => normalizeRow<T>(table, row));
 }
 
 export async function createRow<T>(
@@ -418,17 +514,17 @@ export async function createRow<T>(
 ): Promise<T> {
   const config = baserowConfig(table);
   if (!config) {
-    return normalizeRow<T>({ id: Date.now(), ...values });
+    return normalizeRow<T>(table, { id: Date.now(), ...values });
   }
 
   const row = await baserowRequest<Record<string, unknown>>(
     `${config.baseUrl}/api/database/rows/table/${config.tableId}/?user_field_names=true`,
-    { method: "POST", token: config.token, body: values },
+    { method: "POST", token: config.token, body: valuesForBaserow(table, values) },
   ).catch((error) => {
     throw new Error(`Baserow create failed for ${table}: ${error.message}`);
   });
 
-  return normalizeRow<T>(row);
+  return normalizeRow<T>(table, row);
 }
 
 export async function updateRow<T>(
@@ -438,17 +534,17 @@ export async function updateRow<T>(
 ): Promise<T> {
   const config = baserowConfig(table);
   if (!config) {
-    return normalizeRow<T>({ id, ...values });
+    return normalizeRow<T>(table, { id, ...values });
   }
 
   const row = await baserowRequest<Record<string, unknown>>(
     `${config.baseUrl}/api/database/rows/table/${config.tableId}/${id}/?user_field_names=true`,
-    { method: "PATCH", token: config.token, body: values },
+    { method: "PATCH", token: config.token, body: valuesForBaserow(table, values) },
   ).catch((error) => {
     throw new Error(`Baserow update failed for ${table}: ${error.message}`);
   });
 
-  return normalizeRow<T>(row);
+  return normalizeRow<T>(table, row);
 }
 
 export async function deleteRow(table: TableKey, id: number): Promise<void> {
